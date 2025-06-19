@@ -1,10 +1,17 @@
 package commons
 
 import (
+	"encoding/gob"
+	"image"
 	"net/rpc"
 
 	"github.com/hashicorp/go-plugin"
 )
+
+func init() {
+	gob.Register(&image.RGBA{})
+	gob.Register(&image.Gray{})
+}
 
 type PdfiumRPC struct{ client *rpc.Client }
 

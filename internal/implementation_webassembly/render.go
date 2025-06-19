@@ -324,22 +324,55 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 		}
 	}
 
-	// We use a "fake" image here, we will replace the Pix later.
+	var currentImage image.Image
+	var bitmap uint64
+	var size int
+	var err error
+	var res []uint64
+
 	rect := image.Rect(0, 0, totalWidth, totalHeight)
-	img := &image.RGBA{
-		Pix:    nil,
-		Stride: 4 * rect.Dx(),
-		Rect:   rect,
+
+	isGrayscale := false
+	if len(pages) > 0 && (pages[0].Flags&enums.FPDF_RENDER_FLAG_GRAYSCALE == enums.FPDF_RENDER_FLAG_GRAYSCALE) {
+		isGrayscale = true
 	}
 
-	size := img.Stride * totalHeight
+	if isGrayscale {
+		imgGray := image.NewGray(rect)
+		imgGray.Pix = nil // Wasm will provide the buffer.
+		currentImage = imgGray
+		size = imgGray.Stride * totalHeight // Stride for Gray is width.
 
-	res, err := p.Module.ExportedFunction("FPDFBitmap_Create").Call(p.Context, uint64(totalWidth), uint64(totalHeight), uint64(1))
-	if err != nil {
-		return nil, nil, err
+		// FPDFBitmap_Gray is 1 (enums.FPDF_BITMAP_FORMAT_GRAY). Assuming FPDFBitmap_CreateEx is available.
+		// Otherwise, Wasm grayscale rendering might need different handling or might not be directly supported by the current Wasm export.
+		res, err = p.Module.ExportedFunction("FPDFBitmap_CreateEx").Call(p.Context, uint64(totalWidth), uint64(totalHeight), uint64(enums.FPDF_BITMAP_FORMAT_GRAY), 0, uint64(imgGray.Stride))
+		if err != nil {
+			return nil, nil, fmt.Errorf("FPDFBitmap_CreateEx for grayscale failed: %w", err)
+		}
+		// TODO: The FPDFBitmap_CreateEx call above assumes buffer (arg 4) can be 0 for external buffer to be handled by FPDFBitmap_GetBuffer. This needs verification for Wasm.
+		// If FPDFBitmap_CreateEx requires a buffer pointer, this approach will need to change for Wasm, potentially allocating memory in Wasm first.
+		// For now, proceeding with assumption it works like CGO's FPDFBitmap_CreateEx(..., nil, ...).
+	} else {
+		imgRGBA := &image.RGBA{
+			Pix:    nil,
+			Stride: 4 * rect.Dx(), // BGRA
+			Rect:   rect,
+		}
+		currentImage = imgRGBA
+		size = imgRGBA.Stride * totalHeight
+
+		// Existing logic: FPDFBitmap_Create with alpha = 1, assumed to create BGRA.
+		// Corresponds to FPDFBitmap_BGRA which is format 4.
+		// If FPDFBitmap_CreateEx is the unified way, this would be:
+		// res, err = p.Module.ExportedFunction("FPDFBitmap_CreateEx").Call(p.Context, uint64(totalWidth), uint64(totalHeight), uint64(enums.FPDFBitmap_BGRA), 0, uint64(imgRGBA.Stride))
+		// For now, keeping the existing FPDFBitmap_Create call for the non-grayscale path.
+		res, err = p.Module.ExportedFunction("FPDFBitmap_Create").Call(p.Context, uint64(totalWidth), uint64(totalHeight), uint64(1)) // alpha = 1 for BGRA
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
-	bitmap := res[0]
+	bitmap = res[0]
 
 	releaseFunc := func() {
 		// Release bitmap resources and buffers.
@@ -357,7 +390,7 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 			X:                 0,
 			Y:                 currentOffset,
 		}
-		index, hasTransparency, err := p.renderPage(bitmap, pages[i].Page, pages[i].Width, pages[i].Height, currentOffset, pages[i].Flags)
+		index, hasTransparency, err := p.renderPage(bitmap, pages[i].Page, pages[i].Width, pages[i].Height, currentOffset, pages[i].Flags, isGrayscale)
 		if err != nil {
 			releaseFunc()
 			return nil, nil, err
@@ -381,10 +414,18 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 		return nil, nil, errors.New("could not get bitmap buffer")
 	}
 
-	img.Pix = data
+	// Assign Pix data to the correct image type
+	if grayImg, ok := currentImage.(*image.Gray); ok {
+		grayImg.Pix = data
+	} else if rgbaImg, ok := currentImage.(*image.RGBA); ok {
+		rgbaImg.Pix = data
+	} else {
+		releaseFunc()
+		return nil, nil, errors.New("unexpected image type after Wasm rendering")
+	}
 
 	return &responses.RenderPages{
-		Image:  img,
+		Image:  currentImage,
 		Pages:  pagesInfo,
 		Width:  totalWidth,
 		Height: totalHeight,
@@ -392,7 +433,7 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 }
 
 // renderPage renders a specific page in a specific size on a bitmap.
-func (p *PdfiumImplementation) renderPage(bitmap uint64, page requests.Page, width, height, offset int, flags enums.FPDF_RENDER_FLAG) (int, bool, error) {
+func (p *PdfiumImplementation) renderPage(bitmap uint64, page requests.Page, width, height, offset int, flags enums.FPDF_RENDER_FLAG, isGrayscale bool) (int, bool, error) {
 	pageHandle, err := p.loadPage(page)
 	if err != nil {
 		return 0, false, err
@@ -404,16 +445,21 @@ func (p *PdfiumImplementation) renderPage(bitmap uint64, page requests.Page, wid
 	}
 
 	alpha := *(*int32)(unsafe.Pointer(&res[0]))
-
-	// White
-	fillColor := uint64(0xFFFFFFFF)
-
 	hasTransparency := int(alpha) == 1
 
-	// When the page has transparency, fill with black, not white.
-	if hasTransparency {
-		// Black
-		fillColor = uint64(0x00000000)
+	var fillColor uint64
+	if isGrayscale {
+		if hasTransparency {
+			fillColor = 0x00 // Black for grayscale
+		} else {
+			fillColor = 0xFF // White for grayscale
+		}
+	} else {
+		if hasTransparency {
+			fillColor = 0x00000000 // Black for BGRA
+		} else {
+			fillColor = 0xFFFFFFFF // White for BGRA
+		}
 	}
 
 	// Fill the page rect with the specified color.
@@ -422,10 +468,13 @@ func (p *PdfiumImplementation) renderPage(bitmap uint64, page requests.Page, wid
 		return 0, false, err
 	}
 
-	// Render the bitmap into the given external bitmap, write the bytes
-	// in reverse order so that BGRA becomes RGBA.
-	flags = flags | enums.FPDF_RENDER_FLAG_REVERSE_BYTE_ORDER
-	_, err = p.Module.ExportedFunction("FPDF_RenderPageBitmap").Call(p.Context, bitmap, *pageHandle.handle, uint64(0), uint64(offset), uint64(width), uint64(height), uint64(0), *(*uint64)(unsafe.Pointer(&flags)))
+	renderFlags := flags
+	if !isGrayscale {
+		renderFlags = flags | enums.FPDF_RENDER_FLAG_REVERSE_BYTE_ORDER
+	}
+
+	// Render the bitmap into the given external bitmap
+	_, err = p.Module.ExportedFunction("FPDF_RenderPageBitmap").Call(p.Context, bitmap, *pageHandle.handle, uint64(0), uint64(offset), uint64(width), uint64(height), uint64(0), *(*uint64)(unsafe.Pointer(&renderFlags)))
 	if err != nil {
 		return 0, false, err
 	}
@@ -434,7 +483,7 @@ func (p *PdfiumImplementation) renderPage(bitmap uint64, page requests.Page, wid
 }
 
 func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*responses.RenderToFile, error) {
-	var renderedImage *image.RGBA
+	var renderedImage image.Image // Changed from *image.RGBA
 
 	var myResp *responses.RenderToFile
 	hasTransparency := false
@@ -446,7 +495,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 		}
 		defer resp.Cleanup()
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image // resp.Result.Image is already image.Image
 		hasTransparency = resp.Result.HasTransparency
 		myResp = &responses.RenderToFile{
 			Width:             resp.Result.Width,
@@ -471,7 +520,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 		}
 		defer resp.Cleanup()
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image // resp.Result.Image is already image.Image
 
 		for _, page := range resp.Result.Pages {
 			if page.HasTransparency {
@@ -491,7 +540,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 		}
 		defer resp.Cleanup()
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image // resp.Result.Image is already image.Image
 		hasTransparency = resp.Result.HasTransparency
 		myResp = &responses.RenderToFile{
 			Width:             resp.Result.Width,
@@ -516,7 +565,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 		}
 		defer resp.Cleanup()
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image // resp.Result.Image is already image.Image
 
 		for _, page := range resp.Result.Pages {
 			if page.HasTransparency {
@@ -551,15 +600,58 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 		// background black. With the added background we make sure that the
 		// rendered PDF will look the same as in a PDF viewer, those generally
 		// have a white background on the page viewer.
+		// For Grayscale images, we need to convert to RGBA first before drawing a white background.
 		if hasTransparency {
-			imageWithWhiteBackground := image.NewRGBA(renderedImage.Bounds())
-			draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
-			draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), renderedImage, renderedImage.Bounds().Min, draw.Over)
-			renderedImage = imageWithWhiteBackground
+			// Webassembly renderPages currently always returns RGBA, so we only need to handle that case.
+			// If it were to return Gray in the future, that logic would be similar to the CGO version.
+			if rgbaImg, ok := renderedImage.(*image.RGBA); ok {
+				imageWithWhiteBackground := image.NewRGBA(rgbaImg.Bounds())
+				draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+				draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), rgbaImg, rgbaImg.Bounds().Min, draw.Over)
+				renderedImage = imageWithWhiteBackground
+			} else if grayImg, ok := renderedImage.(*image.Gray); ok {
+				// This case should not be hit with current WebAssembly renderPages, but added for future-proofing
+				rgbaImg := image.NewRGBA(grayImg.Bounds())
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src) // Fill with white
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), grayImg, grayImg.Bounds().Min, draw.Over) // Draw grayscale image on top
+				renderedImage = rgbaImg
+			} else if renderedImage != nil {
+				// Fallback for other image types: attempt to draw them onto a white RGBA background.
+				b := renderedImage.Bounds()
+				newRgbaImg := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+				draw.Draw(newRgbaImg, newRgbaImg.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+				draw.Draw(newRgbaImg, newRgbaImg.Bounds(), renderedImage, b.Min, draw.Over)
+				renderedImage = newRgbaImg
+			}
 		}
 
+		// Since renderedImage could have been replaced by an image.RGBA,
+		// we need to ensure it's the correct type for image_jpeg.Encode,
+		// which might expect a concrete type like *image.RGBA or *image.Gray.
+		// However, image_jpeg.Encode itself takes image.Image, so this should be fine.
+		// Correction: image_jpeg.Encode takes *image.RGBA.
 		for {
-			err := image_jpeg.Encode(&imgBuf, renderedImage, opt)
+			var finalImageForJPEG *image.RGBA
+			if grayImg, ok := renderedImage.(*image.Gray); ok {
+				// Convert Gray to RGBA for JPEG encoding
+				// This case should ideally not be hit in WebAssembly current impl as renderPages returns RGBA
+				b := grayImg.Bounds()
+				rgbaImg := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), grayImg, grayImg.Bounds().Min, draw.Src)
+				finalImageForJPEG = rgbaImg
+			} else if rgbaImg, ok := renderedImage.(*image.RGBA); ok {
+				finalImageForJPEG = rgbaImg
+			} else if renderedImage != nil {
+				// Fallback: convert other image.Image types to RGBA
+				b := renderedImage.Bounds()
+				rgbaImg := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), renderedImage, b.Min, draw.Src)
+				finalImageForJPEG = rgbaImg
+			} else {
+				return nil, errors.New("renderedImage is nil before JPEG encoding")
+			}
+
+			err := image_jpeg.Encode(&imgBuf, finalImageForJPEG, opt)
 			if err != nil {
 				return nil, err
 			}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/klippa-app/go-pdfium/enums"
 	"github.com/klippa-app/go-pdfium/errors"
 	"github.com/klippa-app/go-pdfium/references"
 	"github.com/klippa-app/go-pdfium/requests"
@@ -391,11 +392,40 @@ var _ = Describe("Render", func() {
 							})
 							Expect(err).To(BeNil())
 							Expect(renderedPage).To(Not(BeNil()))
+							Expect(renderedPage.Result.Image).To(BeAssignableToTypeOf(&image.RGBA{}))
 							compareRenderHash(&renderedPage.Result, Or(Equal(&responses.RenderPage{
 								PointToPixelRatio: 1.3888888888888888,
 								Width:             827,
 								Height:            1170,
+								HasTransparency:   false,
 							})), TestDataPath+"/testdata/render_"+TestType+"_testpdf_dpi_100")
+							Expect(renderedPage.Result.Image.Bounds().Size().X).To(Equal(827))
+							Expect(renderedPage.Result.Image.Bounds().Size().Y).To(Equal(1170))
+							renderedPage.Cleanup()
+						})
+					})
+
+					Context("width DPI 100 and grayscale flag", func() {
+						It("returns the right grayscale image, point to pixel ratio and resolution", func() {
+							renderedPage, err := PdfiumInstance.RenderPageInDPI(&requests.RenderPageInDPI{
+								Page: requests.Page{
+									ByIndex: &requests.PageByIndex{
+										Document: doc,
+										Index:    0,
+									},
+								},
+								DPI:         100,
+								RenderFlags: enums.FPDF_RENDER_FLAG_GRAYSCALE,
+							})
+							Expect(err).To(BeNil())
+							Expect(renderedPage).To(Not(BeNil()))
+							Expect(renderedPage.Result.Image).To(BeAssignableToTypeOf(&image.Gray{}))
+							compareRenderHash(&renderedPage.Result, Or(Equal(&responses.RenderPage{
+								PointToPixelRatio: 1.3888888888888888,
+								Width:             827,
+								Height:            1170,
+								HasTransparency:   false,
+							})), TestDataPath+"/testdata/render_"+TestType+"_testpdf_dpi_100_grayscale")
 							Expect(renderedPage.Result.Image.Bounds().Size().X).To(Equal(827))
 							Expect(renderedPage.Result.Image.Bounds().Size().Y).To(Equal(1170))
 							renderedPage.Cleanup()
@@ -416,10 +446,12 @@ var _ = Describe("Render", func() {
 							})
 							Expect(err).To(BeNil())
 							Expect(renderedPage).To(Not(BeNil()))
+							Expect(renderedPage.Result.Image).To(BeAssignableToTypeOf(&image.RGBA{}))
 							compareRenderHash(&renderedPage.Result, Or(Equal(&responses.RenderPage{
 								PointToPixelRatio: 4.166666666666667,
 								Width:             2481,
 								Height:            3508,
+								HasTransparency:   false,
 							})), TestDataPath+"/testdata/render_"+TestType+"_testpdf_dpi_300")
 							Expect(renderedPage.Result.Image.Bounds().Size().X).To(Equal(2481))
 							Expect(renderedPage.Result.Image.Bounds().Size().Y).To(Equal(3508))
@@ -2593,6 +2625,7 @@ func compareRenderHash(renderedPage *responses.RenderPage, matcher types.GomegaM
 		PointToPixelRatio: renderedPage.PointToPixelRatio,
 		Width:             renderedPage.Width,
 		Height:            renderedPage.Height,
+		HasTransparency:   renderedPage.HasTransparency,
 	}
 	Expect(copiedPage).To(matcher)
 	existingFileHashes := []types.GomegaMatcher{}
@@ -2607,7 +2640,18 @@ func compareRenderHash(renderedPage *responses.RenderPage, matcher types.GomegaM
 
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	err = enc.Encode(renderedPage.Image.Pix)
+
+	var pix []byte
+	switch img := renderedPage.Image.(type) {
+	case *image.RGBA:
+		pix = img.Pix
+	case *image.Gray:
+		pix = img.Pix
+	default:
+		// This will cause the test to fail, which is good.
+		Expect(fmt.Errorf("unsupported image type for hashing: %T", renderedPage.Image)).To(BeNil())
+	}
+	err = enc.Encode(pix)
 	Expect(err).To(BeNil())
 
 	hasher.Write(buf.Bytes())
@@ -2640,7 +2684,18 @@ func compareRenderHashForPages(renderedPages *responses.RenderPages, matcher typ
 
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	err = enc.Encode(renderedPages.Image.Pix)
+
+	var pix []byte
+	switch img := renderedPages.Image.(type) {
+	case *image.RGBA:
+		pix = img.Pix
+	case *image.Gray:
+		pix = img.Pix
+	default:
+		// This will cause the test to fail, which is good.
+		Expect(fmt.Errorf("unsupported image type for hashing: %T", renderedPages.Image)).To(BeNil())
+	}
+	err = enc.Encode(pix)
 	Expect(err).To(BeNil())
 
 	hasher := sha256.New()
@@ -2762,7 +2817,7 @@ func compareFileHash(request *requests.RenderToFile, renderedFile *responses.Ren
 	}
 }
 
-func writePrerenderedImage(renderedImage *image.RGBA, testNames ...string) error {
+func writePrerenderedImage(renderedImage image.Image, testNames ...string) error {
 	filename := testNames[len(testNames)-1]
 	if _, err := os.Stat(filename + ".hash"); err == nil {
 		return nil // Comment this in case of updating PDFium versions and rendering has changed.
@@ -2771,7 +2826,18 @@ func writePrerenderedImage(renderedImage *image.RGBA, testNames ...string) error
 	// Be sure to validate the difference in image to ensure rendering has not been broken.
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(renderedImage.Pix); err != nil {
+
+	var pix []byte
+	switch img := renderedImage.(type) {
+	case *image.RGBA:
+		pix = img.Pix
+	case *image.Gray:
+		pix = img.Pix
+	default:
+		return fmt.Errorf("unsupported image type for hashing/saving: %T", renderedImage)
+	}
+
+	if err := enc.Encode(pix); err != nil {
 		return err
 	}
 
@@ -2789,7 +2855,7 @@ func writePrerenderedImage(renderedImage *image.RGBA, testNames ...string) error
 	}
 	defer f.Close()
 
-	err = png.Encode(f, renderedImage)
+	err = png.Encode(f, renderedImage) // png.Encode works with image.Image
 	if err != nil {
 		return err
 	}

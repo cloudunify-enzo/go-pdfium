@@ -314,11 +314,23 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 		}
 	}
 
-	img := image.NewRGBA(image.Rect(0, 0, totalWidth, totalHeight))
+	var currentImage image.Image
+	var bitmap C.FPDF_BITMAP
 
-	// Create a device independent bitmap to the external buffer by passing a
-	// pointer to the first pixel, PDFium will do the rest.
-	bitmap := C.FPDFBitmap_CreateEx(C.int(totalWidth), C.int(totalHeight), C.FPDFBitmap_BGRA, unsafe.Pointer(&img.Pix[0]), C.int(img.Stride))
+	isGrayscale := false
+	if len(pages) > 0 && (pages[0].Flags&enums.FPDF_RENDER_FLAG_GRAYSCALE == enums.FPDF_RENDER_FLAG_GRAYSCALE) {
+		isGrayscale = true
+	}
+
+	if isGrayscale {
+		imgGray := image.NewGray(image.Rect(0, 0, totalWidth, totalHeight))
+		bitmap = C.FPDFBitmap_CreateEx(C.int(totalWidth), C.int(totalHeight), C.FPDFBitmap_Gray, unsafe.Pointer(&imgGray.Pix[0]), C.int(imgGray.Stride))
+		currentImage = imgGray
+	} else {
+		imgRGBA := image.NewRGBA(image.Rect(0, 0, totalWidth, totalHeight))
+		bitmap = C.FPDFBitmap_CreateEx(C.int(totalWidth), C.int(totalHeight), C.FPDFBitmap_BGRA, unsafe.Pointer(&imgRGBA.Pix[0]), C.int(imgRGBA.Stride))
+		currentImage = imgRGBA
+	}
 
 	pagesInfo := make([]responses.RenderPagesPage, len(pages))
 	currentOffset := 0
@@ -331,8 +343,9 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 			X:                 0,
 			Y:                 currentOffset,
 		}
-		index, hasTransparency, err := p.renderPage(bitmap, pages[i].Page, pages[i].Width, pages[i].Height, currentOffset, pages[i].Flags)
+		index, hasTransparency, err := p.renderPage(bitmap, pages[i].Page, pages[i].Width, pages[i].Height, currentOffset, pages[i].Flags, isGrayscale)
 		if err != nil {
+			C.FPDFBitmap_Destroy(bitmap) // Ensure bitmap is destroyed on error
 			return nil, err
 		}
 		pagesInfo[i].Page = index
@@ -345,7 +358,7 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 	C.FPDFBitmap_Destroy(bitmap)
 
 	return &responses.RenderPages{
-		Image:  img,
+		Image:  currentImage,
 		Pages:  pagesInfo,
 		Width:  totalWidth,
 		Height: totalHeight,
@@ -353,37 +366,47 @@ func (p *PdfiumImplementation) renderPages(pages []renderPage, padding int) (*re
 }
 
 // renderPage renders a specific page in a specific size on a bitmap.
-func (p *PdfiumImplementation) renderPage(bitmap C.FPDF_BITMAP, page requests.Page, width, height, offset int, flags enums.FPDF_RENDER_FLAG) (int, bool, error) {
+func (p *PdfiumImplementation) renderPage(bitmap C.FPDF_BITMAP, page requests.Page, width, height, offset int, flags enums.FPDF_RENDER_FLAG, isGrayscale bool) (int, bool, error) {
 	pageHandle, err := p.loadPage(page)
 	if err != nil {
 		return 0, false, err
 	}
 
 	alpha := C.FPDFPage_HasTransparency(pageHandle.handle)
-
-	// White
-	fillColor := uint64(0xFFFFFFFF)
-
 	hasTransparency := int(alpha) == 1
 
-	// When the page has transparency, fill with black, not white.
-	if hasTransparency {
-		// Black
-		fillColor = uint64(0x00000000)
+	var fillColor C.ulong
+	if isGrayscale {
+		if hasTransparency {
+			fillColor = 0x00 // Black for grayscale
+		} else {
+			fillColor = 0xFF // White for grayscale
+		}
+	} else {
+		if hasTransparency {
+			fillColor = 0x00000000 // Black for BGRA
+		} else {
+			fillColor = 0xFFFFFFFF // White for BGRA
+		}
 	}
 
 	// Fill the page rect with the specified color.
-	C.FPDFBitmap_FillRect(bitmap, 0, C.int(offset), C.int(width), C.int(height), C.ulong(fillColor))
+	C.FPDFBitmap_FillRect(bitmap, 0, C.int(offset), C.int(width), C.int(height), fillColor)
 
 	// Render the bitmap into the given external bitmap, write the bytes
 	// in reverse order so that BGRA becomes RGBA.
-	C.FPDF_RenderPageBitmap(bitmap, pageHandle.handle, 0, C.int(offset), C.int(width), C.int(height), 0, C.int(flags)|C.FPDF_REVERSE_BYTE_ORDER)
+	// Note: FPDF_REVERSE_BYTE_ORDER is not needed for grayscale.
+	renderFlags := C.int(flags)
+	if !isGrayscale {
+		renderFlags |= C.FPDF_REVERSE_BYTE_ORDER
+	}
+	C.FPDF_RenderPageBitmap(bitmap, pageHandle.handle, 0, C.int(offset), C.int(width), C.int(height), 0, renderFlags)
 
 	return pageHandle.index, hasTransparency, nil
 }
 
 func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*responses.RenderToFile, error) {
-	var renderedImage *image.RGBA
+	var renderedImage image.Image // Changed from *image.RGBA
 
 	var myResp *responses.RenderToFile
 	hasTransparency := false
@@ -394,7 +417,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 			return nil, err
 		}
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image.(image.Image) // Cast to image.Image
 		hasTransparency = resp.Result.HasTransparency
 		myResp = &responses.RenderToFile{
 			Width:             resp.Result.Width,
@@ -418,7 +441,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 			return nil, err
 		}
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image.(image.Image) // Cast to image.Image
 
 		for _, page := range resp.Result.Pages {
 			if page.HasTransparency {
@@ -437,7 +460,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 			return nil, err
 		}
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image.(image.Image) // Cast to image.Image
 		hasTransparency = resp.Result.HasTransparency
 		myResp = &responses.RenderToFile{
 			Width:             resp.Result.Width,
@@ -461,7 +484,7 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 			return nil, err
 		}
 
-		renderedImage = resp.Result.Image
+		renderedImage = resp.Result.Image.(image.Image) // Cast to image.Image
 
 		for _, page := range resp.Result.Pages {
 			if page.HasTransparency {
@@ -497,15 +520,66 @@ func (p *PdfiumImplementation) RenderToFile(request *requests.RenderToFile) (*re
 		// background black. With the added background we make sure that the
 		// rendered PDF will look the same as in a PDF viewer, those generally
 		// have a white background on the page viewer.
+		// For Grayscale images, we need to convert to RGBA first before drawing a white background.
 		if hasTransparency {
-			imageWithWhiteBackground := image.NewRGBA(renderedImage.Bounds())
-			draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
-			draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), renderedImage, renderedImage.Bounds().Min, draw.Over)
-			renderedImage = imageWithWhiteBackground
+			needsWhiteBackground := true
+			if grayImg, ok := renderedImage.(*image.Gray); ok {
+				// If it's already grayscale and has transparency, JPG will make background black.
+				// To make it white, we need to convert to RGBA and draw on white.
+				rgbaImg := image.NewRGBA(grayImg.Bounds())
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), grayImg, image.Point{}, draw.Src)
+				renderedImage = rgbaImg
+			} else if _, ok := renderedImage.(*image.RGBA); !ok {
+				// If it's some other image type with transparency, we might not handle it perfectly for JPG.
+				// For now, we only explicitly handle Gray and RGBA.
+				// If not RGBA, and has transparency, it's safer to assume it needs a white background.
+			}
+
+
+			if needsWhiteBackground {
+				// Ensure renderedImage is an RGBA image for drawing with white background.
+				// This might involve converting from other formats if they were used.
+				// For this diff, we assume renderedImage will be either *image.Gray or *image.RGBA
+				// due to previous changes. If it's Gray, it was already converted above.
+				// If it's already RGBA, this step is fine.
+				rgbaImage, ok := renderedImage.(*image.RGBA)
+				if !ok {
+					// This case should ideally not be hit if renderedImage is always Gray or RGBA
+					// Convert to RGBA if it's not already
+					b := renderedImage.Bounds()
+					rgbaImage = image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+					draw.Draw(rgbaImage, rgbaImage.Bounds(), renderedImage, b.Min, draw.Src)
+				}
+
+				imageWithWhiteBackground := image.NewRGBA(rgbaImage.Bounds())
+				draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+				draw.Draw(imageWithWhiteBackground, imageWithWhiteBackground.Bounds(), rgbaImage, rgbaImage.Bounds().Min, draw.Over)
+				renderedImage = imageWithWhiteBackground
+			}
 		}
 
+
 		for {
-			err := image_jpeg.Encode(&imgBuf, renderedImage, opt)
+			var finalImageForJPEG *image.RGBA
+			if grayImg, ok := renderedImage.(*image.Gray); ok {
+				// Convert Gray to RGBA for JPEG encoding
+				b := grayImg.Bounds()
+				rgbaImg := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), grayImg, grayImg.Bounds().Min, draw.Src)
+				finalImageForJPEG = rgbaImg
+			} else if rgbaImg, ok := renderedImage.(*image.RGBA); ok {
+				finalImageForJPEG = rgbaImg
+			} else if renderedImage != nil {
+				// Fallback: convert other image.Image types to RGBA
+				b := renderedImage.Bounds()
+				rgbaImg := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+				draw.Draw(rgbaImg, rgbaImg.Bounds(), renderedImage, b.Min, draw.Src)
+				finalImageForJPEG = rgbaImg
+			} else {
+				return nil, errors.New("renderedImage is nil before JPEG encoding")
+			}
+
+			err := image_jpeg.Encode(&imgBuf, finalImageForJPEG, opt)
 			if err != nil {
 				return nil, err
 			}
