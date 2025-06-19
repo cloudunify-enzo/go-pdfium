@@ -190,11 +190,24 @@ func (p *PdfiumImplementation) GetPageTextStructured(request *requests.GetPageTe
 			}
 
 			if request.CollectFontInformation {
-				// Find index of the first letter of the rect.
-				// @todo: is 5 a "valid" tolerance?
-				tolerance := C.double(5)
-				charIndex := C.FPDFText_GetCharIndexAtPos(textPage, C.double(char.PointPosition.Left), C.double(char.PointPosition.Top), tolerance, tolerance)
-				char.FontInformation = p.getFontInformation(textPage, int(charIndex))
+				initialTolerance := C.double(1.0)
+				maxTolerance := C.double(10.0)
+				stepTolerance := C.double(1.0)
+				charIndex := C.int(-1)
+
+				currentTolerance := initialTolerance
+				for currentTolerance <= maxTolerance {
+					foundCharIndex := C.FPDFText_GetCharIndexAtPos(textPage, C.double(char.PointPosition.Left), C.double(char.PointPosition.Top), currentTolerance, currentTolerance)
+					if int(foundCharIndex) >= 0 {
+						charIndex = foundCharIndex
+						break
+					}
+					currentTolerance += stepTolerance
+				}
+
+				if int(charIndex) >= 0 {
+					char.FontInformation = p.getFontInformation(textPage, int(charIndex))
+				}
 			}
 
 			if request.PixelPositions.Calculate {
