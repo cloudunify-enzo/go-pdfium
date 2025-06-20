@@ -7,7 +7,7 @@ import (
 type RenderPage struct {
 	Page              int         // The rendered page number (0-index based).
 	PointToPixelRatio float64     // The point to pixel ratio for the rendered image. How many points is 1 pixel in this image.
-	Image             *image.RGBA // The rendered image.
+	Image             image.Image // The rendered image.
 	Width             int         // The width of the rendered image.
 	Height            int         // The height of the rendered image.
 	HasTransparency   bool        // Whether the page has transparency.
@@ -25,7 +25,7 @@ type RenderPagesPage struct {
 
 type RenderPages struct {
 	Pages  []RenderPagesPage // Information about the rendered pages inside this image.
-	Image  *image.RGBA       // The rendered image.
+	Image  image.Image       // The rendered image.
 	Width  int               // The width of the rendered image.
 	Height int               // The height of the rendered image.
 }
